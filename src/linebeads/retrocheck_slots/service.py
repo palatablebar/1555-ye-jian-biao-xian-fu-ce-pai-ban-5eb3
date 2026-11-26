@@ -134,3 +134,35 @@ def operating_group(assessments, progression):
         band=segment_focus(source[work.key])
         cells[work.cohort,band] += work.cost
     return [{ '作业区': zone, '巡线班位': band, '班组用量': total } for (zone,band),total in sorted(cells.items())]
+
+# 班中更高版次回传后的重签/对账能力，保留在 service 命名空间便于测试导入。
+from .midshift import (  # noqa: E402,F401
+    ACTIONS,
+    BACKFILL,
+    KEEP,
+    PAUSE,
+    WITHDRAW,
+    ResignDecision,
+    ResignResult,
+    ResignTable,
+    apply_field_returns,
+    apply_field_revisions,
+    apply_revisions,
+    assert_reconciled,
+    build_reissue_plan,
+    build_resign_table,
+    expected_cost as revision_expected_cost,
+    reconcile_ledger,
+    reconcile_shift,
+    reissue_slots,
+    resign_board,
+    resign_jobs,
+    resign_shift,
+    resign_table,
+    rule_hits as revision_rule_hits,
+    shift_resign,
+)
+
+def __getattr__(name):
+    from .midshift import __getattr__ as _fallback
+    return _fallback(name)

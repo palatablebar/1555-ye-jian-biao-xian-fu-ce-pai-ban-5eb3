@@ -8,6 +8,7 @@ from flask import Flask, jsonify, render_template, request
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge, UnsupportedMediaType
 
 from .pipeline import DISPLAY, MODULES, execute, open_fixture, preview
+from .retrocheck_slots.midshift import resign_documents, resign_shift
 
 app = Flask(__name__, static_folder='web/static', template_folder='web/templates')
 app.config['MAX_CONTENT_LENGTH'] = 1_500_000
@@ -46,18 +47,34 @@ def overview():
 def run_case():
     try:
         posted = request.get_json()
-        if not isinstance(posted, dict) or posted.keys() - {'capacity', 'strategy', 'records', 'as_of'}:
+        if not isinstance(posted, dict) or posted.keys() - {
+            'capacity', 'strategy', 'records', 'as_of', 'revisions', 'returns',
+            'updates', 'departed', 'departed_keys', 'resign',
+        }:
             raise ValueError('请求字段无效')
         mode = posted.get('strategy', 'balanced')
         capacity, strategy = validate_parameters(posted.get('capacity', 12), mode)
+        revision_records = posted.get('revisions', posted.get('returns', posted.get('updates')))
+        departed = posted.get('departed', posted.get('departed_keys', ()))
         if 'records' not in posted:
             if 'as_of' in posted:
                 raise ValueError('导入截止日需要同时提交 records')
-            return jsonify(sample(capacity, strategy))
-        as_of = posted.get('as_of', 96)
-        if type(as_of) is not int or not 91 <= as_of <= 3650:
-            raise ValueError('截止日须在第 91 日后')
-        return jsonify(execute(posted['records'], capacity, strategy, as_of=as_of))
+            result = sample(capacity, strategy)
+        else:
+            as_of = posted.get('as_of', 96)
+            if type(as_of) is not int or not 91 <= as_of <= 3650:
+                raise ValueError('截止日须在第 91 日后')
+            result = execute(posted['records'], capacity, strategy, as_of=as_of)
+        if revision_records is not None:
+            resignation = resign_shift(
+                result, revision_records, departed=departed, capacity=capacity, mode=strategy,
+                feature_stamp=result.get('feature_stamp'), model=result.get('model'),
+            ).to_dict()
+            result = {**result, 'resignation': resignation,
+                      'resign_table': resignation['table'],
+                      'slot_ledger': resignation['ledger'],
+                      'reconciliation': resignation['reconciliation']}
+        return jsonify(result)
     except (BadRequest, UnsupportedMediaType):
         return jsonify(code='INVALID_JSON', message='请提交 JSON 对象'), 400
     except ValueError as issue:
@@ -80,6 +97,50 @@ def stage_detail(stage):
     return jsonify(run_id=result['run_id'], **result['sections'][mapping[stage]])
 
 
+@app.post('/api/linebeads/resign')
+@app.post('/api/linebeads/reissue')
+@app.post('/api/linebeads/resign-table')
+@app.post('/api/linebeads/shift-resign')
+def resign_case():
+    try:
+        posted = request.get_json()
+        if not isinstance(posted, dict):
+            raise ValueError('请提交 JSON 对象')
+        capacity = posted.get('capacity', 12)
+        strategy = posted.get('strategy', posted.get('mode', 'balanced'))
+        capacity, strategy = validate_parameters(capacity, strategy)
+        revisions = posted.get('revisions', posted.get('returns', posted.get('updates', posted.get('field_reports'))))
+        departed = posted.get('departed', posted.get('departed_keys', ()))
+        board = posted.get('board', posted.get('plan', posted.get('report', posted.get('current'))))
+        if board is None and 'records' in posted:
+            as_of = posted.get('as_of', 96)
+            if type(as_of) is not int or not 91 <= as_of <= 3650:
+                raise ValueError('截止日须在第 91 日后')
+            if revisions is not None and posted.get('recompute_model', True):
+                result = resign_documents(
+                    posted['records'], revisions, capacity=capacity, mode=strategy,
+                    as_of=as_of, departed=departed,
+                )
+            else:
+                board = execute(posted['records'], capacity, strategy, as_of=as_of)
+        if board is None and 'base_report' in posted:
+            board = posted['base_report']
+        if board is None:
+            board = sample(capacity, strategy)
+        if 'result' not in locals():
+            result = resign_shift(
+                board, revisions, departed=departed, capacity=capacity, mode=strategy,
+                feature_stamp=posted.get('feature_stamp'), model=posted.get('model'),
+            )
+        return jsonify(result.to_dict())
+    except (BadRequest, UnsupportedMediaType):
+        return jsonify(code='INVALID_JSON', message='请提交 JSON 对象'), 400
+    except ValueError as issue:
+        return jsonify(code='INVALID_BATCH', message=str(issue)), 422
+    except ArithmeticError as issue:
+        return jsonify(code='LEDGER_UNBALANCED', message=str(issue)), 422
+
+
 @app.errorhandler(RequestEntityTooLarge)
 def rejected_size(_issue):
     return jsonify(code='PAYLOAD_TOO_LARGE', message='单据批次超过 1.5 MB'), 413
@@ -93,9 +154,38 @@ def main():
     runner.add_argument('--strategy', choices=('balanced', 'focus'), default='balanced')
     runner.add_argument('--input', type=Path)
     runner.add_argument('--output', type=Path)
+    resigner = commands.add_parser('resign', help='按更高版次回传生成班中重签表并对账')
+    resigner.add_argument('--board', type=Path, help='首班 /run 导出的 JSON；省略时使用内置样例')
+    resigner.add_argument('--revisions', type=Path, help='回传记录 JSON：数组或 {"revisions": [...]}')
+    resigner.add_argument('--departed', help='逗号分隔的已出车单号')
+    resigner.add_argument('--capacity', type=int, default=12)
+    resigner.add_argument('--strategy', choices=('balanced', 'focus'), default='balanced')
+    resigner.add_argument('--markdown', action='store_true', help='输出 Markdown 班报表格')
+    resigner.add_argument('--output', type=Path)
     server = commands.add_parser('serve', help='打开本地工作台')
     server.add_argument('--port', type=int, default=8000)
     args = parser.parse_args()
+    if args.command == 'resign':
+        try:
+            from .retrocheck_slots.midshift import render_resign_markdown
+            board = json.loads(args.board.read_text(encoding='utf-8')) if args.board else sample(args.capacity, args.strategy)
+            revision_document = json.loads(args.revisions.read_text(encoding='utf-8')) if args.revisions else []
+            if isinstance(revision_document, dict):
+                revision_records = revision_document.get('revisions', revision_document.get('returns', []))
+            else:
+                revision_records = revision_document
+            departed = [item.strip() for item in args.departed.split(',') if item.strip()] if args.departed else ()
+            result = resign_shift(board, revision_records, departed=departed,
+                                  capacity=args.capacity, mode=args.strategy)
+            output = render_resign_markdown(result) if args.markdown else json.dumps(
+                result.to_dict(), ensure_ascii=False, indent=2, allow_nan=False) + '\n'
+        except (ValueError, OSError, ArithmeticError, json.JSONDecodeError) as issue:
+            parser.error(str(issue))
+        if args.output:
+            args.output.write_text(output, encoding='utf-8')
+        else:
+            print(output, end='')
+        return
     if args.command == 'serve':
         from waitress import serve
         sample()
